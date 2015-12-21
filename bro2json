@@ -1,0 +1,190 @@
+#!/usr/bin/env python
+
+import json
+import gzip
+import os
+import sys
+import binascii
+import argparse
+import traceback
+
+EXCLUDE_LIST=["conn-summary.", "stdout.", "stderr.", "reporter.", "packet_filter.", "loaded_scripts."]
+
+class fileHeader(object):
+    def __init__(self):
+        self.separator = '\t'
+        self.unset = '-'
+        self.empty = '(empty)'
+        self.set_separator = ','
+        self.path = None
+        self.open = None
+        self.fields = None
+        self.types = None
+        self.close = None
+
+
+class outputHandler(object):
+    def __init__(self, outputBase, outputDirectory, filename, compress = 'source'):
+        self.stdout = False
+        self.outputHandle = None
+
+        if outputBase == '-':
+            self.stdout = True
+        else: #Check if directory exists first
+            fullpath = outputBase
+
+            if outputDirectory is not None:
+                fullpath = os.path.join(outputBase, outputDirectory)
+
+            if not os.path.isdir(fullpath):
+                os.makedirs(fullpath)
+
+            dest = os.path.join(fullpath, filename)
+            if (compress == 'source' and dest.endswith(".gz")) or compress == 'always':
+                if not dest.endswith(".gz"):
+                    dest = dest + ".gz"
+                self.outputHandle = gzip.open(dest, 'w+')
+            else:
+                if dest.endswith(".gz"):
+                    dest = dest[:-3]
+                self.outputHandle = open(dest, 'w+')
+
+    def write(self, data):
+        jdata = json.dumps(data)
+        if not self.stdout:
+            self.outputHandle.write(jdata)
+            self.outputHandle.write('\n')
+        else:
+            print(jdata) 
+
+def convertBroType(inData, type, fh):
+    if type.startswith('set') or type.startswith('vector'):
+        innerType = type.split('[')[1][:-1]
+
+        if inData == fh.empty:
+            return []
+
+        values = inData.split(fh.set_separator)
+        outData = []
+        for v in values:
+            convertedData = convertBroSimple(v, innerType, fh)
+            if convertedData is not None:
+                outData.append(convertedData)
+        return outData
+    else:
+        return convertBroSimple(inData, type, fh)
+
+def convertBroSimple(inData, type, fh):
+    bro_integer_types = ['port', 'count', 'int']
+    bro_float_types = ['double', 'time', 'interval']
+    """
+        addr, string, subnet and enums are treated as strings
+    """
+
+    if inData == fh.unset:
+        return None
+
+    if type in bro_integer_types:
+        return int(inData)
+
+    if type in bro_float_types:
+        return float(inData)
+
+    if type == 'bool':
+        if inData == 'T':
+            return True
+        else:
+            return False
+
+    return inData
+
+def processDirectory(directory, args):
+    if directory.endswith("/"):
+        directory = directory[:-1]
+    basedir = os.path.split(directory)[1]
+    for (dirname, dirlist, filelist) in os.walk(directory):
+        for f in filelist:
+            exclude = False
+            for excluded in args.exclude:
+                if f.startswith(excluded):
+                    exclude = True
+                    break
+            if not exclude:
+                filename = os.path.join(dirname, f)
+                processFile(filename, args, basedir)
+
+def processFileContents(filename, handle, outputDirectory, args):
+        fh = fileHeader()
+        try:
+            first_line = handle.readline()
+            if not first_line.startswith('#separator'):
+                sys.stderr.write("File %s does not look like a bro formatted file\n" % filename)
+                return
+
+            fh.separator = binascii.unhexlify(first_line.split()[1][2:])
+            oh = outputHandler(args.output, outputDirectory, filename, args.gzip)
+            for line in handle:
+                columns = line.strip().split(fh.separator)
+                if columns[0][0] == '#':
+                    command = columns[0][1:]
+                    if command == 'fields':
+                        fh.fields = columns[1:]
+                    elif command == 'types':
+                        fh.types = columns[1:]
+                    else:
+                        value = columns[1]
+                        setattr(fh, command, value)
+                else:
+                    row = {}
+                    try:
+                        for i, column in enumerate(columns):
+                            convertedValue = convertBroType(column, fh.types[i], fh)
+                            if convertedValue is not None:
+                                row[fh.fields[i]] = convertedValue
+                        if args.path:
+                            row['@path'] = fh.path
+                        oh.write(row)
+                    except Exception as e:
+                        tb = traceback.format_exc()
+                        sys.stderr.write("Unable to process line in %s, skipping: %s\n%s\nOffending line: '%s'" % (filename, str(e), tb, line))
+        except Exception as e:
+            tb = traceback.format_exc()
+            sys.stderr.write("Exception while processing %s: %s\n%s" % (filename, str(e), tb))
+            return
+
+def processFile(filename, args, outputDirectory = None):
+    shortname = os.path.basename(filename)
+    if args.verbose:
+        sys.stderr.write("Processing File: %s\n" % filename)
+    if filename.endswith(".gz"):
+        with gzip.open(filename) as f:
+            processFileContents(shortname, f, outputDirectory, args)
+    else:
+        with open(filename) as f:
+            processFileContents(shortname, f, outputDirectory, args)
+
+def main():
+
+    parser = argparse.ArgumentParser(description='Convert bro formatted logs to json logs.')
+    parser.add_argument('source', action='store', nargs="+", help='Source[s] to convert, could be a file or a directory of files, or multiple files or directories')
+    parser.add_argument('-e', '--exclude', dest='exclude', action='store', nargs="+", default=EXCLUDE_LIST, help='If processing a directory exclude files that begin with these strings')
+    parser.add_argument('-o', '--output', dest='output', action='store', default='./', help='An output destination directory to write the data, defaults to cwd, use "-" to write to stdout')
+    parser.add_argument('-g', '--gzip', dest='gzip', action='store', default='source', choices=['always', 'source', 'never'], help='Determine whether output files will be gzip compressed, "source" will gzip compress if the source was  -- option ignored if output is stdout')
+    parser.add_argument('-p', '--path', dest='path', action='store_true', default=False, help="Store the bro 'path' field as '@path' in the json output helpful if processing output in an automated fashion")
+    parser.add_argument('-v', '--verbose', dest='verbose', action='store_true', default=False, help='Be Verbose')
+
+    args = parser.parse_args()
+
+    for source in args.source:
+        if os.path.isdir(source):
+            if args.verbose:
+                sys.stderr.write("Processing Directory: %s\n" % source)
+            processDirectory(source, args)
+        elif os.path.isfile(source):
+            processFile(source, args)
+        else:
+            sys.stderr.write("Unable to determine source type, can't process\n")
+            sys.exit(1)
+    
+if __name__ == "__main__":
+    main()
